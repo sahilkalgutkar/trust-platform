@@ -19,3 +19,6 @@ flags:
   identity-service:
     paths:
       - identity-service/src/main/
+  authz-service:
+    paths:
+      - authz-service/src/main/

@@ -37,4 +37,11 @@ jobs:
           flags: identity-service
           fail_ci_if_error: false
 
+      - name: Upload coverage (authz-service)
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: authz-service/target/site/jacoco/jacoco.xml
+          flags: authz-service
+          fail_ci_if_error: false
 
