@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.sahilkalgutkar.trust</groupId>
+  <artifactId>trust-platform</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>trust-platform</name>
+  <description>Multi-tenant identity provider, Zanzibar-style authorization service, and tamper-evident audit log</description>
+
+  <modules>
+    <module>common</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <java.version>21</java.version>
+    <maven.compiler.release>21</maven.compiler.release>
+    <spring-boot.version>3.3.4</spring-boot.version>
+    <testcontainers.version>1.21.3</testcontainers.version>
+    <nimbus-jose-jwt.version>9.41.1</nimbus-jose-jwt.version>
+    <jacoco.version>0.8.12</jacoco.version>
+    <maven-surefire-plugin.version>3.3.1</maven-surefire-plugin.version>
+    <maven-failsafe-plugin.version>3.3.1</maven-failsafe-plugin.version>
+    <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
+    <!-- Testcontainers still negotiates Docker API 1.32, and Docker Engine 26+ refuses anything
+         below 1.40 — it answers /info with an HTTP 400 whose body is an empty Info object, which
+         Testcontainers reports as the famously unhelpful "Could not find a valid Docker
+         environment". Pinning a version both ends accept keeps the integration tests runnable on
+         current Docker Desktop as well as on the older engine a CI runner may ship; 1.41 has been
+         supported since Docker 20.10. Override with -Ddocker.api.version=... if your daemon wants
+         something else. -->
+    <docker.api.version>1.41</docker.api.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- Ahead of spring-boot-dependencies deliberately: the first imported BOM to manage an
+           artifact wins, and Boot 3.3 pins Testcontainers 1.19, whose default Docker API version
+           (1.32) is below the minimum Docker Engine 26+ will serve. Importing this first is what
+           actually takes effect; bumping the property alone silently does nothing. -->
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers-bom</artifactId>
+        <version>${testcontainers.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.nimbusds</groupId>
+        <artifactId>nimbus-jose-jwt</artifactId>
+        <version>${nimbus-jose-jwt.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.sahilkalgutkar.trust</groupId>
+        <artifactId>common</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-maven-plugin</artifactId>
+          <version>${spring-boot.version}</version>
+          <executions>
+            <execution>
+              <id>repackage</id>
+              <goals>
+                <goal>repackage</goal>
+              </goals>
+              <!-- Classifier keeps the plain jar as the module's main artifact so Failsafe's
+                   classpath still resolves the module's own classes during integration-test;
+                   the executable jar lands beside it as target/<artifact>-exec.jar, which is
+                   what the Dockerfiles copy. -->
+              <configuration>
+                <classifier>exec</classifier>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>${maven-compiler-plugin.version}</version>
+        <configuration>
+          <release>${maven.compiler.release}</release>
+          <parameters>true</parameters>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${maven-surefire-plugin.version}</version>
+        <configuration>
+          <excludes>
+            <exclude>**/*IT.java</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>${maven-failsafe-plugin.version}</version>
+        <configuration>
+          <includes>
+            <include>**/*IT.java</include>
+          </includes>
+          <systemPropertyVariables>
+            <!-- docker-java reads the API version from this system property. -->
+            <api.version>${docker.api.version}</api.version>
+          </systemPropertyVariables>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>${jacoco.version}</version>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>prepare-agent-integration</id>
+            <goals>
+              <goal>prepare-agent-integration</goal>
+            </goals>
+          </execution>
+          <!-- Unit and integration runs write separate .exec files; merge them so the
+               Codecov report reflects everything the build actually exercised. -->
+          <execution>
+            <id>merge-exec</id>
+            <phase>post-integration-test</phase>
+            <goals>
+              <goal>merge</goal>
+            </goals>
+            <configuration>
+              <destFile>${project.build.directory}/jacoco-merged.exec</destFile>
+              <fileSets>
+                <fileSet>
+                  <directory>${project.build.directory}</directory>
+                  <includes>
+                    <include>jacoco*.exec</include>
+                  </includes>
+                </fileSet>
+              </fileSets>
+            </configuration>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>report</goal>
+            </goals>
+            <configuration>
+              <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

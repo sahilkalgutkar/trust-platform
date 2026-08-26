@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Testcontainers starts Postgres, Redis, and Kafka against the runner's own Docker daemon,
+      # so there is no `services:` block here — the tests bring up exactly what they need.
+      - name: mvn verify (unit tests via Surefire, Testcontainers ITs via Failsafe)
+        run: ./mvnw -B --fail-at-end verify
+
+      - name: Upload coverage (common)
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: common/target/site/jacoco/jacoco.xml
+          flags: common
+          fail_ci_if_error: false
+
+
+
