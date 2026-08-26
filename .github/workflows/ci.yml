@@ -29,5 +29,12 @@ jobs:
           flags: common
           fail_ci_if_error: false
 
+      - name: Upload coverage (identity-service)
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: identity-service/target/site/jacoco/jacoco.xml
+          flags: identity-service
+          fail_ci_if_error: false
 
 

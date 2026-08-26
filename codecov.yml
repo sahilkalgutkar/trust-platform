@@ -16,3 +16,6 @@ flags:
   common:
     paths:
       - common/src/main/
+  identity-service:
+    paths:
+      - identity-service/src/main/

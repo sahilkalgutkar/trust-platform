@@ -1,0 +1,56 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: identity-service
+  datasource:
+    url: ${IDENTITY_DB_URL:jdbc:postgresql://localhost:5432/trust_identity}
+    username: ${IDENTITY_DB_USER:trust}
+    password: ${IDENTITY_DB_PASSWORD:trust}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. Validate rather than update, so a migration this service has
+      # not been told about fails at startup instead of being silently patched over at runtime.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+trust:
+  identity:
+    issuer-base-url: ${ISSUER_BASE_URL:http://localhost:8081}
+    access-token-ttl: 15m
+    refresh-token-ttl: 30d
+    authorization-code-ttl: 1m
+    retired-key-grace-period: 24h
+    admin-api-key: ${ADMIN_API_KEY:local-dev-admin-key}
+    master-key: ${TRUST_MASTER_KEY:}
+    outbox-poll-interval-ms: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    org.hibernate.SQL: ${SQL_LOG_LEVEL:warn}
