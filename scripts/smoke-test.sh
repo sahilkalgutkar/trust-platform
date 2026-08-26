@@ -16,6 +16,20 @@ TENANT="smoke-$RANDOM"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAILED: %s\033[0m\n' "$1" >&2; exit 1; }
 
+# Belt and braces alongside the compose healthchecks: this script is also meant to be runnable by
+# hand, moments after `docker compose up`, without the caller having to guess when to start.
+step "Waiting for all three services to answer"
+for service in "identity:$IDENTITY" "authz:$AUTHZ" "audit:$AUDIT"; do
+  name="${service%%:*}"; url="${service#*:}"
+  for attempt in $(seq 1 60); do
+    if curl -sf "$url/actuator/health" | grep -q UP; then
+      echo "$name is up"; break
+    fi
+    [ "$attempt" -eq 60 ] && fail "$name never became healthy at $url"
+    sleep 2
+  done
+done
+
 step "Creating tenant '$TENANT'"
 TENANT_ID=$(curl -sf -X POST "$IDENTITY/admin/tenants" \
   -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
