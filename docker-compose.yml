@@ -1,0 +1,127 @@
+# The whole platform, locally: three services, three databases, Redis, and Kafka.
+#
+#   docker compose up --build
+#
+# Then walk through the flows in docs/WALKTHROUGH.md, or run scripts/smoke-test.sh.
+
+name: trust-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trust
+      POSTGRES_PASSWORD: trust
+      # Each service owns its own database. One Postgres instance keeps local development to a
+      # single container, but the services never share a schema or read each other's tables.
+      POSTGRES_MULTIPLE_DATABASES: trust_identity,trust_authz,trust_audit
+    volumes:
+      - ./scripts/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    # No host port. Postgres, Redis, and Kafka are reachable from the services over the compose
+    # network, and publishing them collides with whatever a developer already has on 5432. Use
+    # `docker compose exec postgres psql -U trust -d trust_identity` to get a shell.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trust"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  identity-service:
+    build:
+      context: .
+      dockerfile: identity-service/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      IDENTITY_DB_URL: jdbc:postgresql://postgres:5432/trust_identity
+      IDENTITY_DB_USER: trust
+      IDENTITY_DB_PASSWORD: trust
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ISSUER_BASE_URL: http://localhost:8081
+      ADMIN_API_KEY: local-dev-admin-key
+      # 32 zero bytes, base64. Fine for a laptop; in a real deployment this comes from a KMS.
+      TRUST_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8081/actuator/health | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  authz-service:
+    build:
+      context: .
+      dockerfile: authz-service/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity-service:
+        condition: service_healthy
+    environment:
+      AUTHZ_DB_URL: jdbc:postgresql://postgres:5432/trust_authz
+      AUTHZ_DB_USER: trust
+      AUTHZ_DB_PASSWORD: trust
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # The issuer is what tokens claim and is compared against `iss`, so it must match the
+      # identity service's own ISSUER_BASE_URL exactly. The JWKS URL is where this service dials
+      # to fetch keys, which inside the compose network is the container name, not localhost.
+      ISSUER_BASE_URL: http://localhost:8081
+      JWKS_BASE_URL: http://identity-service:8081
+    ports:
+      - "8082:8082"
+
+  audit-service:
+    build:
+      context: .
+      dockerfile: audit-service/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      AUDIT_DB_URL: jdbc:postgresql://postgres:5432/trust_audit
+      AUDIT_DB_USER: trust
+      AUDIT_DB_PASSWORD: trust
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ADMIN_API_KEY: local-dev-admin-key
+    ports:
+      - "8083:8083"
