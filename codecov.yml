@@ -22,3 +22,6 @@ flags:
   authz-service:
     paths:
       - authz-service/src/main/
+  audit-service:
+    paths:
+      - audit-service/src/main/

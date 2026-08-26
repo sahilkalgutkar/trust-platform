@@ -1,0 +1,48 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: audit-service
+  datasource:
+    url: ${AUDIT_DB_URL:jdbc:postgresql://localhost:5432/trust_audit}
+    username: ${AUDIT_DB_USER:trust}
+    password: ${AUDIT_DB_PASSWORD:trust}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${AUDIT_CONSUMER_GROUP:audit-service}
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Read from the beginning on a fresh group: an audit consumer that skipped whatever was
+      # produced before it first started would leave a permanent gap at the head of the chain.
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+      # One thread per partition, and the topic is keyed by tenant — a chain can only be extended
+      # from one place at a time.
+      concurrency: 1
+
+trust:
+  audit:
+    admin-api-key: ${ADMIN_API_KEY:local-dev-admin-key}
+    consumer-group: ${AUDIT_CONSUMER_GROUP:audit-service}
+    max-page-size: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
