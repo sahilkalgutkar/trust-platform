@@ -1,0 +1,9 @@
+.git
+.github
+**/target
+docs
+*.md
+!README.md
+.idea
+.vscode
+.DS_Store
