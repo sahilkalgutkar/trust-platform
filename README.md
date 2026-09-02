@@ -144,6 +144,26 @@ docker compose up --build
 ./scripts/smoke-test.sh
 ```
 
+| Service | URL | Host port override |
+|---|---|---|
+| identity-service | http://localhost:8081 | `IDENTITY_HOST_PORT` |
+| authz-service | http://localhost:8082 | `AUTHZ_HOST_PORT` |
+| audit-service | http://localhost:8083 | `AUDIT_HOST_PORT` |
+
+> If one of those is already taken, override it (inline or in `.env` — see
+> `.env.example`). The smoke test reads its own URLs, so move both together:
+>
+> ```bash
+> IDENTITY_HOST_PORT=8181 docker compose up --build
+> IDENTITY_URL=http://localhost:8181 ./scripts/smoke-test.sh
+> ```
+>
+> Only the host side moves — inside the compose network the services still
+> reach each other, and Postgres, Redis and Kafka, on the standard ports. The
+> one exception is `IDENTITY_HOST_PORT`: both services' `ISSUER_BASE_URL` is
+> built from it, since the issuer is what a token claims to an outside caller
+> and what authz-service compares `iss` against.
+
 The smoke test — the same one CI runs — creates a tenant, mints a token from the identity service,
 uses that token to define a namespace and grant a permission in the authorization service, checks a
 permission that was never written down anywhere, and then verifies that both services' events
