@@ -86,6 +86,18 @@ revocation used to run inline and then throw `invalid_grant` to reject the reque
 exception rolled back the very transaction the revocation had just been written in. The replay was
 detected, reported, and then silently forgiven. It now commits in its own transaction.
 
+**A replay can arrive at the same moment as the original** —
+[`ConcurrentRedemptionIT`](identity-service/src/test/java/com/sahilkalgutkar/trust/identity/ConcurrentRedemptionIT.java).
+Checking `consumed_at` on a row I had just read proved nothing until my own consumption committed.
+Under READ COMMITTED, a second refresh that read the token in between passed the same check, and
+both requests walked away with live tokens in one family, so reuse detection never fired. The same
+went for authorization codes. Each grant now consumes its credential with
+`UPDATE … WHERE consumed_at IS NULL`, and a redemption that changes no rows is a replay. The fix had
+a trap of its own: the request that loses that update still holds the row's lock until its
+transaction ends, and revoking the family updates the same row, so a revocation started from inside
+the grant would wait on itself forever. The family is now revoked once the grant's transaction has
+rolled back.
+
 **The tenant predicate is not optional** —
 [`TenantIdentifierResolver`](identity-service/src/main/java/com/sahilkalgutkar/trust/identity/config/TenantIdentifierResolver.java).
 Tenant scoping runs through Hibernate's discriminator-based multi-tenancy, so `findByEmail(...)`
@@ -114,7 +126,7 @@ caught by checking those columns against the signed payload.
 
 ## What the tests are for
 
-**362 unit tests and 69 integration tests, at 92% line and 86% branch coverage.** The integration
+**365 unit tests and 71 integration tests, at 92% line and 86% branch coverage.** The integration
 tests run against real Postgres, Redis, and Kafka through Testcontainers, because the behaviour
 being tested is often the database's: the tenant discriminator, the partial unique index that makes
 key rotation safe, the constraint that lets two tenants both register a client called `web-app`.
@@ -129,6 +141,7 @@ than an invented one, and each produces a token or a request that *parses*:
 | PKCE downgrade — claiming `plain` and replaying the challenge | `PkceValidatorTest.anS256ChallengeCannotBeDowngraded…` |
 | Confused deputy — redeeming another client's code | `TokenServiceTest.aCodeIssuedToAnotherClientIsRejectedAndBurned` |
 | Stolen refresh token replayed after rotation | `…presentingAnAlreadyRotatedTokenRevokesTheWholeFamily` |
+| Stolen code or refresh token redeemed at the same moment as the original | `ConcurrentRedemptionIT` |
 | Open redirect via an unregistered `redirect_uri` | `OAuthFlowIT.anUnregisteredRedirectUriIsRefusedWithoutARedirect` |
 | Cross-tenant code redemption, token replay, and introspection | `TenantIsolationIT` (12 tests) |
 | Editing the audit table with plain SQL | `AuditPipelineIT.editingAStoredRecordWithSqlIsDetected` |
