@@ -27,6 +27,10 @@ import java.util.UUID;
  * the rejection and the revocation no longer share a fate. It is a separate bean for the same
  * reason: Spring's proxying means a self-invocation would silently reuse the caller's transaction
  * and reintroduce exactly the bug it is here to prevent.
+ *
+ * <p>For a replay, {@code TokenService} goes one step further and calls this only after its own
+ * transaction has rolled back. A request that lost a race to redeem the same credential still
+ * holds a lock on that credential's row, and revoking the family has to update it.
  */
 @Component
 public class CompromiseResponder {

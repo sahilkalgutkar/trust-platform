@@ -17,6 +17,7 @@ import com.sahilkalgutkar.trust.identity.repo.RefreshTokenRepository;
 import com.sahilkalgutkar.trust.identity.repo.UserRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -46,6 +47,7 @@ public class TokenService {
     private final AuditRecorder auditRecorder;
     private final IdentityProperties properties;
     private final Clock clock;
+    private final TransactionOperations transactions;
 
     public TokenService(AuthorizationCodeRepository codeRepository,
                         CompromiseResponder compromiseResponder,
@@ -55,7 +57,8 @@ public class TokenService {
                         JwtIssuer jwtIssuer,
                         AuditRecorder auditRecorder,
                         IdentityProperties properties,
-                        Clock clock) {
+                        Clock clock,
+                        TransactionOperations transactions) {
         this.codeRepository = codeRepository;
         this.compromiseResponder = compromiseResponder;
         this.refreshTokenRepository = refreshTokenRepository;
@@ -65,10 +68,30 @@ public class TokenService {
         this.auditRecorder = auditRecorder;
         this.properties = properties;
         this.clock = clock;
+        this.transactions = transactions;
     }
 
-    @Transactional
+    /**
+     * Runs the grant in a transaction of its own, and responds to a replay only once that
+     * transaction has rolled back.
+     *
+     * <p>The order matters when two requests redeem one credential at the same moment. Each
+     * consumes it with a conditional update, and the one that loses has waited on the row the
+     * winner was consuming. PostgreSQL keeps that row locked for the rest of the loser's
+     * transaction, even though its update changed nothing. Revoking the family updates that same
+     * row, so a revocation started while the loser's transaction was still open would wait on a
+     * lock its own request holds, and never finish.
+     */
     public TokenResponse exchange(TokenRequest request, OAuthClientEntity client, String tenantSlug) {
+        try {
+            return transactions.execute(status -> grant(request, client, tenantSlug));
+        } catch (ReplayDetected replay) {
+            compromiseResponder.revokeFamily(replay.familyId, replay.at, replay.event);
+            throw OAuthException.badRequest(OAuthErrors.INVALID_GRANT, "Grant rejected");
+        }
+    }
+
+    private TokenResponse grant(TokenRequest request, OAuthClientEntity client, String tenantSlug) {
         String grantType = request.grantType();
         if (grantType == null || grantType.isBlank()) {
             throw OAuthException.badRequest(OAuthErrors.INVALID_REQUEST, "grant_type is required");
@@ -98,16 +121,8 @@ public class TokenService {
         if (code.isConsumed()) {
             // RFC 6749 §4.1.2: a code presented twice must be assumed leaked. Everything the first
             // presentation produced goes with it — the family id of those refresh tokens is the
-            // code's own id, precisely so this revocation can find them. It commits separately,
-            // because the exception below rolls this transaction back.
-            compromiseResponder.revokeFamily(code.getId(), now,
-                    AuditEvent.builder(TenantContext.require(), "code.replay_detected")
-                            .actor("client:" + client.getClientId())
-                            .resource("authorization_code", code.getId().toString())
-                            .outcome(AuditOutcome.DENIED)
-                            .occurredAt(now)
-                            .build());
-            throw OAuthException.badRequest(OAuthErrors.INVALID_GRANT, "Grant rejected");
+            // code's own id, precisely so the revocation can find them.
+            throw codeReplay(code, client, now);
         }
         if (code.isExpiredAt(now)) {
             throw OAuthException.badRequest(OAuthErrors.INVALID_GRANT, "Grant rejected");
@@ -129,8 +144,11 @@ public class TokenService {
         }
         pkceValidator.verify(code.getCodeChallenge(), code.getCodeChallengeMethod(), request.codeVerifier());
 
-        code.consume(now);
-        codeRepository.save(code);
+        if (codeRepository.consumeIfUnused(code.getId(), now) == 0) {
+            // Another exchange of this code consumed it after the check above read it: the same
+            // replay, caught where the two exchanges meet.
+            throw codeReplay(code, client, now);
+        }
 
         UserEntity user = userRepository.findById(code.getUserId())
                 .filter(UserEntity::isActive)
@@ -174,25 +192,18 @@ public class TokenService {
         if (presented.getConsumedAt() != null || presented.getRevokedAt() != null) {
             // Someone is replaying a token that has already been rotated away. The provider cannot
             // tell whether this request or the earlier one came from the attacker, so it trusts
-            // neither and kills the family — in its own transaction, so the rejection below cannot
-            // roll the revocation back.
-            compromiseResponder.revokeFamily(presented.getFamilyId(), now,
-                    AuditEvent.builder(TenantContext.require(), "refresh.reuse_detected")
-                            .actor("client:" + client.getClientId())
-                            .resource("refresh_family", presented.getFamilyId().toString())
-                            .outcome(AuditOutcome.DENIED)
-                            .attribute("user_id", presented.getUserId().toString())
-                            .occurredAt(now)
-                            .build());
-            throw OAuthException.badRequest(OAuthErrors.INVALID_GRANT, "Grant rejected");
+            // neither and kills the family.
+            throw refreshReplay(presented, client, now);
         }
         if (!presented.isUsable(now) || !presented.getClientId().equals(client.getClientId())) {
             throw OAuthException.badRequest(OAuthErrors.INVALID_GRANT, "Grant rejected");
         }
 
         String scope = Scopes.resolveRefreshed(request.scope(), presented.getScope());
-        presented.consume(now);
-        refreshTokenRepository.save(presented);
+        if (refreshTokenRepository.consumeIfUnused(presented.getId(), now) == 0) {
+            // Another refresh of this token consumed it after the check above read it.
+            throw refreshReplay(presented, client, now);
+        }
 
         UserEntity user = userRepository.findById(presented.getUserId())
                 .filter(UserEntity::isActive)
@@ -243,6 +254,47 @@ public class TokenService {
         // a refresh token would be a second, longer-lived credential bought for nothing.
         return new TokenResponse(accessToken, "Bearer",
                 properties.getAccessTokenTtl().toSeconds(), null, null, scope);
+    }
+
+    private static ReplayDetected codeReplay(AuthorizationCodeEntity code, OAuthClientEntity client, Instant now) {
+        return new ReplayDetected(code.getId(), now,
+                AuditEvent.builder(TenantContext.require(), "code.replay_detected")
+                        .actor("client:" + client.getClientId())
+                        .resource("authorization_code", code.getId().toString())
+                        .outcome(AuditOutcome.DENIED)
+                        .occurredAt(now)
+                        .build());
+    }
+
+    private static ReplayDetected refreshReplay(RefreshTokenEntity presented, OAuthClientEntity client,
+                                                Instant now) {
+        return new ReplayDetected(presented.getFamilyId(), now,
+                AuditEvent.builder(TenantContext.require(), "refresh.reuse_detected")
+                        .actor("client:" + client.getClientId())
+                        .resource("refresh_family", presented.getFamilyId().toString())
+                        .outcome(AuditOutcome.DENIED)
+                        .attribute("user_id", presented.getUserId().toString())
+                        .occurredAt(now)
+                        .build());
+    }
+
+    /**
+     * Thrown out of the grant's transaction when the credential turns out to have been used
+     * already, carrying what {@link #exchange} needs to revoke the family once that transaction
+     * has rolled back.
+     */
+    private static final class ReplayDetected extends RuntimeException {
+
+        private final UUID familyId;
+        private final Instant at;
+        private final AuditEvent event;
+
+        ReplayDetected(UUID familyId, Instant at, AuditEvent event) {
+            super("replay detected", null, false, false);
+            this.familyId = familyId;
+            this.at = at;
+            this.event = event;
+        }
     }
 
     private String issueRefreshToken(UUID familyId, String clientId, UUID userId, String scope, Instant now) {

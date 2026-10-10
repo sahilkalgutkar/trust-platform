@@ -18,6 +18,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -29,11 +32,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -52,6 +58,20 @@ class TokenServiceTest {
     private final AuditRecorder auditRecorder = mock(AuditRecorder.class);
     private final IdentityProperties properties = new IdentityProperties();
 
+    /** Stands in for the grant's transaction, so a test can tell what happened inside it. */
+    private final AtomicBoolean inTransaction = new AtomicBoolean();
+    private final TransactionOperations transactions = new TransactionOperations() {
+        @Override
+        public <T> T execute(TransactionCallback<T> action) {
+            inTransaction.set(true);
+            try {
+                return action.doInTransaction(new SimpleTransactionStatus());
+            } finally {
+                inTransaction.set(false);
+            }
+        }
+    };
+
     private InMemoryRefreshTokenRepository refreshTokens;
     private TokenService tokenService;
     private UserEntity user;
@@ -67,7 +87,7 @@ class TokenServiceTest {
                 new CompromiseResponder(refreshTokens, codeRepository, auditRecorder),
                 refreshTokens, userRepository,
                 new PkceValidator(), jwtIssuer, auditRecorder, properties,
-                Clock.fixed(NOW, ZoneOffset.UTC));
+                Clock.fixed(NOW, ZoneOffset.UTC), transactions);
 
         user = new UserEntity(UUID.randomUUID(), "ada@acme.test", "hash");
         client = new OAuthClientEntity(UUID.randomUUID(), "web-app", "Web App");
@@ -106,13 +126,36 @@ class TokenServiceTest {
 
     @Test
     void theCodeIsConsumedSoItCannotBeUsedTwice() {
-        String rawCode = givenStoredCode(code(NOW.plusSeconds(60)));
+        AuthorizationCodeEntity code = code(NOW.plusSeconds(60));
+        String rawCode = givenStoredCode(code);
 
         tokenService.exchange(codeRequest(rawCode, "https://app.acme.test/callback", VERIFIER), client, "acme");
 
-        ArgumentCaptor<AuthorizationCodeEntity> saved = ArgumentCaptor.forClass(AuthorizationCodeEntity.class);
-        verify(codeRepository).save(saved.capture());
-        assertThat(saved.getValue().isConsumed()).isTrue();
+        verify(codeRepository).consumeIfUnused(code.getId(), NOW);
+        assertThat(code.isConsumed()).isTrue();
+    }
+
+    /**
+     * Two exchanges of one code at the same moment: both read it unconsumed, and this one loses
+     * the conditional update to the other. That is a replay like any other, caught later.
+     */
+    @Test
+    void aCodeAnotherExchangeConsumedAfterItWasReadIsTreatedAsAReplay() {
+        AuthorizationCodeEntity code = code(NOW.plusSeconds(60));
+        String rawCode = givenStoredCode(code);
+        when(codeRepository.consumeIfUnused(eq(code.getId()), any())).thenReturn(0);
+        RefreshTokenEntity issuedToTheOther = new RefreshTokenEntity(UUID.randomUUID(), Tokens.hash("other"),
+                code.getId(), "web-app", user.getId(), "openid profile", NOW.plusSeconds(3600));
+        refreshTokens.save(issuedToTheOther);
+
+        assertThatThrownBy(() -> tokenService.exchange(
+                codeRequest(rawCode, "https://app.acme.test/callback", VERIFIER), client, "acme"))
+                .isInstanceOf(OAuthException.class)
+                .hasMessage("Grant rejected");
+
+        assertThat(issuedToTheOther.getRevokedAt()).isEqualTo(NOW);
+        assertThat(refreshTokens.findAll()).containsExactly(issuedToTheOther);
+        assertThat(recordedActions()).contains("code.replay_detected");
     }
 
     @Test
@@ -272,6 +315,47 @@ class TokenServiceTest {
         assertThat(recordedActions()).contains("refresh.reuse_detected");
     }
 
+    /** The race this guards against: two refreshes both read the token unconsumed, and this one loses. */
+    @Test
+    void aTokenAnotherRefreshConsumedAfterItWasReadIsTreatedAsAReplay() {
+        String token = givenIssuedRefreshToken();
+        RefreshTokenEntity presented = refreshTokens.findByTokenHash(Tokens.hash(token)).orElseThrow();
+        RefreshTokenEntity rotatedForTheOther = new RefreshTokenEntity(UUID.randomUUID(), Tokens.hash("other"),
+                presented.getFamilyId(), "web-app", user.getId(), "openid profile", NOW.plusSeconds(3600));
+        refreshTokens.save(rotatedForTheOther);
+        refreshTokens.loseTheNextRace();
+
+        assertThatThrownBy(() -> tokenService.exchange(refreshRequest(token, null), client, "acme"))
+                .isInstanceOf(OAuthException.class)
+                .hasMessage("Grant rejected");
+
+        assertThat(rotatedForTheOther.getRevokedAt()).isEqualTo(NOW);
+        assertThat(refreshTokens.findAll()).containsExactlyInAnyOrder(presented, rotatedForTheOther);
+        assertThat(recordedActions()).contains("refresh.reuse_detected");
+    }
+
+    /**
+     * A refresh that lost the race still holds a lock on the token's row until its transaction
+     * ends, and the revocation updates that row, so it has to wait until the grant is over.
+     */
+    @Test
+    void theFamilyIsRevokedOnlyAfterTheGrantsTransactionHasEnded() {
+        String stolen = givenIssuedRefreshToken();
+        tokenService.exchange(refreshRequest(stolen, null), client, "acme");
+        List<Boolean> revokedInsideTheGrant = new ArrayList<>();
+        doAnswer(call -> {
+            if (call.<AuditEvent>getArgument(0).action().equals("refresh.reuse_detected")) {
+                revokedInsideTheGrant.add(inTransaction.get());
+            }
+            return null;
+        }).when(auditRecorder).record(any());
+
+        assertThatThrownBy(() -> tokenService.exchange(refreshRequest(stolen, null), client, "acme"))
+                .isInstanceOf(OAuthException.class);
+
+        assertThat(revokedInsideTheGrant).containsExactly(false);
+    }
+
     @Test
     void aRevokedTokenCannotBeRefreshed() {
         String token = givenIssuedRefreshToken();
@@ -421,6 +505,13 @@ class TokenServiceTest {
         String raw = Tokens.generate();
         when(codeRepository.findByCodeHash(Tokens.hash(raw))).thenReturn(Optional.of(code));
         when(codeRepository.findById(code.getId())).thenReturn(Optional.of(code));
+        when(codeRepository.consumeIfUnused(eq(code.getId()), any())).thenAnswer(call -> {
+            if (code.isConsumed()) {
+                return 0;
+            }
+            code.consume(call.getArgument(1));
+            return 1;
+        });
         return raw;
     }
 
@@ -453,6 +544,27 @@ class TokenServiceTest {
             implements RefreshTokenRepository {
 
         private final Map<UUID, RefreshTokenEntity> byId = new ConcurrentHashMap<>();
+        private boolean loseTheNextRace;
+
+        /** Has the next conditional consumption find that another refresh consumed the token first. */
+        void loseTheNextRace() {
+            loseTheNextRace = true;
+        }
+
+        @Override
+        public int consumeIfUnused(UUID id, Instant at) {
+            RefreshTokenEntity token = byId.get(id);
+            if (loseTheNextRace) {
+                loseTheNextRace = false;
+                token.consume(at);
+                return 0;
+            }
+            if (token == null || token.getConsumedAt() != null || token.getRevokedAt() != null) {
+                return 0;
+            }
+            token.consume(at);
+            return 1;
+        }
 
         @Override
         public Optional<RefreshTokenEntity> findByTokenHash(String tokenHash) {

@@ -28,8 +28,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ConcurrentRedemptionIT extends AbstractIdentityIT {
 
-    private static final String HANDED_TO_FIRST = "the-token-the-first-redemption-issued";
-
     @Autowired
     private DataSource dataSource;
 
@@ -37,6 +35,7 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
     void aRefreshRacingAnotherRefreshOfTheSameTokenIsTreatedAsAReplay() throws Exception {
         Fixture fixture = provision("race-refresh", true);
         String token = (String) exchangeCode(fixture, authorizeForCode(fixture)).getBody().get("refresh_token");
+        String handedToFirst = "handed-to-the-first-refresh";
 
         ResponseEntity<Map<String, Object>> second;
         try (Connection first = dataSource.getConnection()) {
@@ -44,7 +43,7 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
             execute(first, """
                     INSERT INTO refresh_tokens (id, tenant_id, token_hash, family_id, client_id, user_id, scope, expires_at)
                     SELECT gen_random_uuid(), tenant_id, ?, family_id, client_id, user_id, scope, expires_at
-                    FROM refresh_tokens WHERE token_hash = ?""", Tokens.hash(HANDED_TO_FIRST), Tokens.hash(token));
+                    FROM refresh_tokens WHERE token_hash = ?""", Tokens.hash(handedToFirst), Tokens.hash(token));
             execute(first, "UPDATE refresh_tokens SET consumed_at = now() WHERE token_hash = ?", Tokens.hash(token));
 
             CompletableFuture<ResponseEntity<Map<String, Object>>> racing =
@@ -57,13 +56,14 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
         assertThat(second.getStatusCode().value()).isEqualTo(400);
         assertThat(second.getBody()).containsEntry("error", "invalid_grant");
         // Either request could be the thief's, so the token the first one was handed goes too.
-        assertThat(liveTokensInTheFamilyOf(HANDED_TO_FIRST)).isZero();
+        assertThat(liveTokensInTheFamilyOf(handedToFirst)).isZero();
     }
 
     @Test
     void aCodeExchangeRacingAnotherExchangeOfTheSameCodeIsTreatedAsAReplay() throws Exception {
         Fixture fixture = provision("race-code", true);
         String code = authorizeForCode(fixture);
+        String handedToFirst = "handed-to-the-first-exchange";
 
         ResponseEntity<Map<String, Object>> second;
         try (Connection first = dataSource.getConnection()) {
@@ -71,7 +71,7 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
             execute(first, """
                     INSERT INTO refresh_tokens (id, tenant_id, token_hash, family_id, client_id, user_id, scope, expires_at)
                     SELECT gen_random_uuid(), tenant_id, ?, id, client_id, user_id, scope, now() + interval '30 days'
-                    FROM authorization_codes WHERE code_hash = ?""", Tokens.hash(HANDED_TO_FIRST), Tokens.hash(code));
+                    FROM authorization_codes WHERE code_hash = ?""", Tokens.hash(handedToFirst), Tokens.hash(code));
             execute(first, "UPDATE authorization_codes SET consumed_at = now() WHERE code_hash = ?", Tokens.hash(code));
 
             CompletableFuture<ResponseEntity<Map<String, Object>>> racing =
@@ -83,7 +83,7 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
 
         assertThat(second.getStatusCode().value()).isEqualTo(400);
         assertThat(second.getBody()).containsEntry("error", "invalid_grant");
-        assertThat(liveTokensInTheFamilyOf(HANDED_TO_FIRST)).isZero();
+        assertThat(liveTokensInTheFamilyOf(handedToFirst)).isZero();
     }
 
     private static void execute(Connection connection, String sql, String... parameters) throws SQLException {
