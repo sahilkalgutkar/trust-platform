@@ -98,6 +98,15 @@ transaction ends, and revoking the family updates the same row, so a revocation 
 the grant would wait on itself forever. The family is now revoked once the grant's transaction has
 rolled back.
 
+Revoking a family had the same shape of race from the other side. It read the family's tokens and
+saved each one revoked, so a rotation in flight at that moment, which had consumed the live token
+and inserted its replacement but not yet committed, left the replacement live in a revoked family,
+and the save wrote back the old token's `consumed_at` as it had been read. A logout racing a
+refresh did the same. A single `UPDATE … WHERE family_id = ?` is not enough either: it waits for
+the rotation's lock, but its snapshot predates the new token. The revocation now repeats that
+update until it changes nothing, so each pass waits for the rotations holding a member and the
+next one sees what they issued.
+
 **The tenant predicate is not optional** —
 [`TenantIdentifierResolver`](identity-service/src/main/java/com/sahilkalgutkar/trust/identity/config/TenantIdentifierResolver.java).
 Tenant scoping runs through Hibernate's discriminator-based multi-tenancy, so `findByEmail(...)`
@@ -126,7 +135,7 @@ caught by checking those columns against the signed payload.
 
 ## What the tests are for
 
-**365 unit tests and 71 integration tests, at 92% line and 86% branch coverage.** The integration
+**365 unit tests and 73 integration tests, at 92% line and 86% branch coverage.** The integration
 tests run against real Postgres, Redis, and Kafka through Testcontainers, because the behaviour
 being tested is often the database's: the tenant discriminator, the partial unique index that makes
 key rotation safe, the constraint that lets two tenants both register a client called `web-app`.
@@ -142,6 +151,7 @@ than an invented one, and each produces a token or a request that *parses*:
 | Confused deputy — redeeming another client's code | `TokenServiceTest.aCodeIssuedToAnotherClientIsRejectedAndBurned` |
 | Stolen refresh token replayed after rotation | `…presentingAnAlreadyRotatedTokenRevokesTheWholeFamily` |
 | Stolen code or refresh token redeemed at the same moment as the original | `ConcurrentRedemptionIT` |
+| Replay detected, or a logout, while the family's live token is being rotated | `ConcurrentRedemptionIT` |
 | Open redirect via an unregistered `redirect_uri` | `OAuthFlowIT.anUnregisteredRedirectUriIsRefusedWithoutARedirect` |
 | Cross-tenant code redemption, token replay, and introspection | `TenantIsolationIT` (12 tests) |
 | Editing the audit table with plain SQL | `AuditPipelineIT.editingAStoredRecordWithSqlIsDetected` |
