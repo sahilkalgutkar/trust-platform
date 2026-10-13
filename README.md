@@ -107,6 +107,10 @@ the rotation's lock, but its snapshot predates the new token. The revocation now
 update until it changes nothing, so each pass waits for the rotations holding a member and the
 next one sees what they issued.
 
+I modelled these races in [txrace](https://github.com/sahilkalgutkar/txrace), my JDBC
+interleaving explorer, by replaying the SQL Hibernate sends here. It finds an order that breaks
+each old version, and passes each fix having judged every order with up to two preemptions.
+
 **The tenant predicate is not optional** —
 [`TenantIdentifierResolver`](identity-service/src/main/java/com/sahilkalgutkar/trust/identity/config/TenantIdentifierResolver.java).
 Tenant scoping runs through Hibernate's discriminator-based multi-tenancy, so `findByEmail(...)`
