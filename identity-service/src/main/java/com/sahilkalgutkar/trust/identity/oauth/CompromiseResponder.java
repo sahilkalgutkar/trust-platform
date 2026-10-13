@@ -3,7 +3,6 @@ package com.sahilkalgutkar.trust.identity.oauth;
 import com.sahilkalgutkar.trust.common.audit.AuditEvent;
 import com.sahilkalgutkar.trust.identity.audit.AuditRecorder;
 import com.sahilkalgutkar.trust.identity.domain.AuthorizationCodeEntity;
-import com.sahilkalgutkar.trust.identity.domain.RefreshTokenEntity;
 import com.sahilkalgutkar.trust.identity.repo.AuthorizationCodeRepository;
 import com.sahilkalgutkar.trust.identity.repo.RefreshTokenRepository;
 import org.springframework.stereotype.Component;
@@ -11,7 +10,6 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.util.List;
 import java.util.UUID;
 
 /**
@@ -47,12 +45,26 @@ public class CompromiseResponder {
         this.auditRecorder = auditRecorder;
     }
 
-    /** Revokes every token descended from one grant, and records why. */
+    /**
+     * Revokes every token descended from one grant, and records why.
+     *
+     * <p>The family's live token can be in the middle of a rotation while this runs: consumed, its
+     * row locked, and a new token inserted but not committed. Reading the family and revoking what
+     * was read misses that new token, so it stays live in a revoked family. A single update of the
+     * family misses it too, because the update waits for the locked row but its snapshot was taken
+     * before the new token existed. So the update runs until it revokes nothing: each pass waits
+     * for the rotations holding a member, and the next pass sees what they issued. A rotation that
+     * starts after a pass finds its token revoked, and is refused.
+     *
+     * <p>The update sets {@code revoked_at} and nothing else. Saving the entities read first wrote
+     * every column back as it was read, which undid a consumption that committed in between.
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void revokeFamily(UUID familyId, Instant at, AuditEvent event) {
-        List<RefreshTokenEntity> family = refreshTokenRepository.findAllByFamilyId(familyId);
-        family.forEach(token -> token.revoke(at));
-        refreshTokenRepository.saveAll(family);
+        int revoked;
+        do {
+            revoked = refreshTokenRepository.revokeUnrevoked(familyId, at);
+        } while (revoked > 0);
         auditRecorder.record(event);
     }
 

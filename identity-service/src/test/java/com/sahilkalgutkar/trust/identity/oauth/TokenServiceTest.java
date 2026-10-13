@@ -572,8 +572,11 @@ class TokenServiceTest {
         }
 
         @Override
-        public List<RefreshTokenEntity> findAllByFamilyId(UUID familyId) {
-            return byId.values().stream().filter(t -> t.getFamilyId().equals(familyId)).toList();
+        public int revokeUnrevoked(UUID familyId, Instant at) {
+            List<RefreshTokenEntity> unrevoked = byId.values().stream()
+                    .filter(t -> t.getFamilyId().equals(familyId) && t.getRevokedAt() == null).toList();
+            unrevoked.forEach(t -> t.revoke(at));
+            return unrevoked.size();
         }
 
         @Override
