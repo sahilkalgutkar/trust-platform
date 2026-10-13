@@ -86,6 +86,112 @@ class ConcurrentRedemptionIT extends AbstractIdentityIT {
         assertThat(liveTokensInTheFamilyOf(handedToFirst)).isZero();
     }
 
+    /**
+     * A replay that revokes the family while the legitimate client is rotating the family's live
+     * token. Both are real requests. The rotation is held at its insert of the new token by a
+     * transaction of the test's own that locks the user's row, which the insert's foreign key
+     * check has to share, so the rotation has already consumed the old token and holds its lock.
+     */
+    @Test
+    void aRevocationRacingARotationAlsoRevokesTheTokenTheRotationIssues() throws Exception {
+        Fixture fixture = provision("race-revoke", true);
+        String stolen = (String) exchangeCode(fixture, authorizeForCode(fixture)).getBody().get("refresh_token");
+        String live = (String) refresh(fixture, stolen).getBody().get("refresh_token");
+
+        ResponseEntity<Map<String, Object>> rotation;
+        ResponseEntity<Map<String, Object>> replay;
+        try (Connection holdingTheUser = dataSource.getConnection()) {
+            holdingTheUser.setAutoCommit(false);
+            lockTheUserOf(holdingTheUser, live);
+            CompletableFuture<ResponseEntity<Map<String, Object>>> rotating =
+                    CompletableFuture.supplyAsync(() -> refresh(fixture, live));
+            awaitSessionsWaitingOnALock(1);
+            CompletableFuture<ResponseEntity<Map<String, Object>>> replaying =
+                    CompletableFuture.supplyAsync(() -> refresh(fixture, stolen));
+            awaitSessionsWaitingOnALock(2);
+            holdingTheUser.commit();
+            rotation = rotating.get(30, TimeUnit.SECONDS);
+            replay = replaying.get(30, TimeUnit.SECONDS);
+        }
+
+        assertThat(rotation.getStatusCode().value()).isEqualTo(200);
+        assertThat(replay.getStatusCode().value()).isEqualTo(400);
+        assertThat(liveTokensInTheFamilyOf(stolen)).isZero();
+        assertThat(consumedAt(live)).as("the rotation's consumption of the token it rotated").isNotNull();
+    }
+
+    /** The same race through RFC 7009 revocation: a client that logs out mid-refresh. */
+    @Test
+    void aLogoutRacingARotationAlsoRevokesTheTokenTheRotationIssues() throws Exception {
+        Fixture fixture = provision("race-logout", true);
+        String token = (String) exchangeCode(fixture, authorizeForCode(fixture)).getBody().get("refresh_token");
+
+        ResponseEntity<Map<String, Object>> rotation;
+        ResponseEntity<Map<String, Object>> logout;
+        try (Connection holdingTheUser = dataSource.getConnection()) {
+            holdingTheUser.setAutoCommit(false);
+            lockTheUserOf(holdingTheUser, token);
+            CompletableFuture<ResponseEntity<Map<String, Object>>> rotating =
+                    CompletableFuture.supplyAsync(() -> refresh(fixture, token));
+            awaitSessionsWaitingOnALock(1);
+            CompletableFuture<ResponseEntity<Map<String, Object>>> revoking =
+                    CompletableFuture.supplyAsync(() -> postForm(fixture.issuerPath() + "/oauth2/revoke",
+                            clientAuth(fixture), Map.of("token", token, "client_id", fixture.clientId())));
+            awaitSessionsWaitingOnALock(2);
+            holdingTheUser.commit();
+            rotation = rotating.get(30, TimeUnit.SECONDS);
+            logout = revoking.get(30, TimeUnit.SECONDS);
+        }
+
+        assertThat(rotation.getStatusCode().value()).isEqualTo(200);
+        assertThat(logout.getStatusCode().value()).isEqualTo(200);
+        assertThat(liveTokensInTheFamilyOf(token)).isZero();
+    }
+
+    private static void lockTheUserOf(Connection connection, String rawToken) throws SQLException {
+        try (PreparedStatement lock = connection.prepareStatement("""
+                SELECT id FROM users WHERE id = (SELECT user_id FROM refresh_tokens WHERE token_hash = ?)
+                FOR UPDATE""")) {
+            lock.setString(1, Tokens.hash(rawToken));
+            try (ResultSet rows = lock.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+            }
+        }
+    }
+
+    private void awaitSessionsWaitingOnALock(int sessions) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        try (Connection watcher = dataSource.getConnection();
+             PreparedStatement waiting = watcher.prepareStatement("""
+                     SELECT count(*) FROM pg_stat_activity
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'""")) {
+            while (true) {
+                try (ResultSet rows = waiting.executeQuery()) {
+                    rows.next();
+                    if (rows.getInt(1) >= sessions) {
+                        return;
+                    }
+                }
+                if (System.nanoTime() > deadline) {
+                    throw new AssertionError("Expected " + sessions + " requests waiting on a lock");
+                }
+                Thread.sleep(10);
+            }
+        }
+    }
+
+    private Object consumedAt(String rawToken) throws SQLException {
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement select = connection.prepareStatement(
+                     "SELECT consumed_at FROM refresh_tokens WHERE token_hash = ?")) {
+            select.setString(1, Tokens.hash(rawToken));
+            try (ResultSet rows = select.executeQuery()) {
+                rows.next();
+                return rows.getObject(1);
+            }
+        }
+    }
+
     private static void execute(Connection connection, String sql, String... parameters) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             for (int i = 0; i < parameters.length; i++) {
